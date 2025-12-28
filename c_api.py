@@ -3,12 +3,13 @@ import ctypes
 import functools
 import inspect
 import threading
-from typing import Any, Annotated
 from collections.abc import Callable
+from ctypes.util import find_library
+from typing import Any, Annotated
 
 from .itypes import KeyValue, KeySelector, ErrorPredicate, StreamingMode
 
-capi: ctypes.CDLL
+capi = ctypes.CDLL(find_library("fdb"))
 
 # TODO handle this better
 HEADER_VERSION = API_VERSION = 740

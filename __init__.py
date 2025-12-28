@@ -44,7 +44,6 @@ def _transaction_timer(name: str) -> Generator[None, None | bool, Never]:  # typ
                 '(%dns elapsed in transaction "%s": %d retries, %scommitted)'
             )
             _log.warning(msg, now - start, name, retries, not_)
-        retries += 1
 
 
 class Tenant:
@@ -120,7 +119,6 @@ class Snapshot:
             )
             for kv in kvs:
                 yield kv
-            iteration += 1
 
             if limit:
                 limit -= len(kvs)
