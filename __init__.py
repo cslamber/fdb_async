@@ -1,5 +1,6 @@
 from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
 import functools
+import inspect
 import itertools
 import json
 import logging
@@ -245,24 +246,22 @@ versionstamp = VersionstampTemplate(b"\x00" * 10, 0)
 
 # compatibility
 def transactional(fn, arg="tr"):
-    import inspect
-
     sig = inspect.getsignature(fn)
 
     def inner(*args, **kwargs):
         ba = sig.bind(*args, **kwargs)
         arg = ba["tr"]
-        if isinstance(arg, Database | Tenant):
-
-            @arg.transact
-            def ret(tr):
-                ba["tr"] = tr
-                return fn(*ba.args, **ba.kwargs)
-
-            return ret
-        else:
+        if not isinstance(arg, Tenant):
             return fn(*ba.args, **ba.kwargs)
 
+        @arg.transact
+        def ret(tr):
+            ba["tr"] = tr
+            return fn(*ba.args, **ba.kwargs)
+
+        return ret
+
     return functools.update_wrapper(inner, fn)
+
 
 # TODO tuples

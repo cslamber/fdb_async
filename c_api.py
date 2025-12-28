@@ -52,7 +52,7 @@ class FDBError(Exception):
 # weakref to stop the thread if all databases get cleaned up
 # NOTE: doesn't work because fdb does not allow restarting the thread
 _network_thread: Callable[[], object] = lambda: None
-_network_thread_lock = threading.Lock()
+network_thread_lock = threading.Lock()
 initialized = False
 
 
@@ -144,21 +144,22 @@ def api_func[T: Callable](fn: T, prefix="") -> T:
         argfunc_globals,
     )
     argfunc = argfunc_globals["argfunc"]
+    inner: Callable
 
     if inspect.iscoroutinefunction(fn):
         res_func = future_result_handlers[ret]
         c_func.restype = ctypes.c_void_p
 
-        async def inner(*args, **kwargs):
+        async def inner(*args, **kwargs) -> Any:
             fdb_fut = Future(c_func(*argfunc(*args, **kwargs)))
             # asyncio futures are not thread safe so the fast path of this has
             # to call_soon_threadsafe: do the check manually in case I can avoid
             # it
-            if not fdb_fut._is_ready():
+            if not fdb_fut.is_ready():
                 fut = asyncio.get_running_loop().create_future()
                 py_incref(fut)  # reference held by C
                 try:
-                    fdb_fut._set_callback(hook_future_cb, ctypes.py_object(fut))
+                    fdb_fut.set_callback(hook_future_cb, ctypes.py_object(fut))
                 except:
                     py_decref(fut)
                     raise
@@ -166,12 +167,12 @@ def api_func[T: Callable](fn: T, prefix="") -> T:
                 try:
                     await fut
                 except:
-                    fdb_fut._cancel()
+                    fdb_fut.cancel()
                     # I have to be able handle the potential race of _cancel()
                     # against the callback firing, in which I have to know
                     # whether the callback actually ran and decremented the
                     # refcount of `fut` by checking _is_ready()
-                    if not fdb_fut._is_ready():
+                    if not fdb_fut.is_ready():
                         py_decref(fut)
                     raise
             return res_func(fdb_fut)
@@ -188,14 +189,14 @@ def api_func[T: Callable](fn: T, prefix="") -> T:
 
         if isinstance(ret, type) and issubclass(ret, Handle):
 
-            def inner(*args, **kwargs):
+            def inner(*args, **kwargs) -> Any:
                 out = ctypes.c_void_p()
                 c_func(*argfunc(*args, **kwargs), ctypes.byref(out))
                 return ret(out)
 
         else:
 
-            def inner(*args, **kwargs):
+            def inner(*args, **kwargs) -> Any:
                 return c_func(*argfunc(*args, **kwargs))
 
     return functools.update_wrapper(inner, fn)  # type: ignore
