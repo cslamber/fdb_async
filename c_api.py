@@ -310,7 +310,7 @@ class Future(Handle):
         buf = ctypes.pointer(ctypes.c_char_p())
         count = ctypes.c_int()
         self.get_string_array(ctypes.byref(buf), ctypes.byref(count))
-        return list(buf[: count.value])
+        return [s.value for s in buf[: count.value]]
 
 
 class Transaction(Handle):
