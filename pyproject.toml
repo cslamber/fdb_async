@@ -1,0 +1,6 @@
+[project]
+name = "fdb_async"
+requires-python = ">=3.14"
+
+[tool.mypy]
+files = '__init__.py'
