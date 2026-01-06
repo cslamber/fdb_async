@@ -174,12 +174,6 @@ def api_func[T: Callable](fn: T, prefix="") -> T:
                     await fut
                 except:
                     fdb_fut.cancel()
-                    # have to be able handle the potential race of cancel()
-                    # against the callback firing, so use is_ready() to check
-                    # whether the callback has or will run and decrement the
-                    # refcount of `fut`, otherwise decrement it here
-                    if not fdb_fut.is_ready():
-                        py_decref(fut)
                     raise
             return res_func(fdb_fut)
 
