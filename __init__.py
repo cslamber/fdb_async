@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Never, TYPE_CHECKING, overload
+from typing import Final, Never, TYPE_CHECKING, overload
 
 from .itypes import (
     ClientStatus,
@@ -69,8 +69,11 @@ class Database(Tenant, opts.DatabaseOptions):
         self._ptr: c_api.Database = c_api.create_database(
             b"" if cluster_file is None else str(cluster_file).encode()
         )
-        self._db = self
-        self._fdb_thread = c_api.fdb_thread()
+        self._fdb_thread = c_api.NetworkThread.get()
+
+    @property
+    def _db(self) -> Database:  # type: ignore[override]
+        return self
 
     async def client_status(self) -> ClientStatus:
         return json.loads(await self._ptr.get_client_status())

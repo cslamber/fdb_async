@@ -1,15 +1,15 @@
 import asyncio
+import _ctypes
 import ctypes
 import functools
 import inspect
 import threading
+import weakref
 from collections.abc import Callable
 from ctypes.util import find_library
-from typing import Any, Annotated
+from typing import Any, Annotated, ClassVar
 
 from .itypes import KeyValue, KeySelector, ErrorPredicate, StreamingMode
-
-capi = ctypes.CDLL(find_library("fdb"))
 
 # TODO handle this better
 HEADER_VERSION = API_VERSION = 740
@@ -30,7 +30,7 @@ class KeyStruct(ctypes.Structure):
     _pack_ = 4
 
 
-# why is this not in std?
+# feels wrong to modify argtypes of ctypes.pythonapi, but this is correct so idk
 py_incref = ctypes.pythonapi.Py_IncRef
 py_decref = ctypes.pythonapi.Py_DecRef
 py_incref.argtypes = py_decref.argtypes = [ctypes.py_object]
@@ -50,16 +50,34 @@ class FDBError(Exception):
         return get_error(self.code).decode()
 
 
-# weakref to stop the thread if all databases get cleaned up
-# NOTE: doesn't work because fdb does not allow restarting the thread
-_network_thread: Callable[[], object] = lambda: None
-network_thread_lock = threading.Lock()
-initialized = False
-
-
 class NetworkThread(threading.Thread):
+    # only one of these will ever exist
     name = "fdb-network-thread"
     daemon = False
+
+    # weakref to stop the thread if unused
+    _active: Callable[[], object] = lambda: None
+    _lock = threading.Lock()
+    _capi: ClassVar[ctypes.CDLL]
+
+    def __init__(self) -> None:
+        NetworkThread._capi = ctypes.CDLL(find_library("fdb"))
+        for func in on_load_init:
+            func()
+        select_api_version_impl(API_VERSION, HEADER_VERSION)
+        setup_network()
+        super().__init__()
+
+    @classmethod
+    def get(cls) -> object:
+        with cls._lock:
+            if thread := cls._active():
+                return thread
+
+            thread = NetworkThread()
+            thread.start()
+            cls._active = weakref.ref(thread)
+            return thread
 
     def run(self) -> None:
         # TODO error handling
@@ -68,31 +86,11 @@ class NetworkThread(threading.Thread):
     # the python program will not exit until this thread joins
     def __del__(self) -> None:
         stop_network()
-
-
-def fdb_init() -> None:
-    global initialized
-    if initialized:
-        return
-
-    select_api_version_impl(API_VERSION, HEADER_VERSION)
-    initialized = True
-
-
-def fdb_thread() -> object:
-    global _network_thread
-    with network_thread_lock:
-        if thread := _network_thread():
-            return None
-
-        fdb_init()
-        setup_network()
-        thread = NetworkThread()
-        thread.start()
-        _network_thread = lambda: thread
-        return None
-        # if fdb allows restarting thread, then replace with:
-        # _network_thread = weakref.ref(thread); return thread
+        if hasattr(_ctypes, "dlclose"):
+            _ctypes.dlclose(NetworkThread._capi._handle)
+        else:
+            _ctypes.FreeLibrary(NetworkThread._capi._handle)  # type: ignore[attr-defined]
+        del NetworkThread._capi
 
 
 @ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)
@@ -102,9 +100,17 @@ def hook_future_cb(_fdb_fut: ctypes.c_void_p, py_fut: ctypes.c_void_p) -> None:
     fut.get_loop().call_soon_threadsafe(fut.set_result, None)
 
 
+on_load_init: list[Callable[[], None]] = []
 future_result_handlers: dict[object, Callable] = {}
 
 NoExcept = Annotated[None, "noexcept"]
+
+
+@functools.cache
+def make_argfunc(body: str) -> Callable:
+    argfunc_globals: dict[str, Any] = {}
+    exec(body, argfunc_globals)
+    return argfunc_globals["argfunc"]
 
 
 # generate a type-safe body for fdb api functions
@@ -112,44 +118,43 @@ def api_func[T: Callable](fn: T, prefix="") -> T:
     sig = inspect.signature(fn)
     ret = sig.return_annotation
 
+    c_func: Callable = None  # type: ignore[assignment]
+    argtypes = []
+    argfunc_return = ""
+    do_errcheck = False
+
     # ctypes doesn't allow for multiple-argument from_param functions nor param
     # names, so I manually implement them here by generating a function with the
     # same signature that outputs the tuple of arguments to the c function -
     # maybe change in the future
-    c_func = capi[f"fdb_{prefix}{fn.__name__}"]
-    c_func.argtypes = []
-    argfunc_return = ""
-
     for name, param in sig.parameters.items():
         ann = param.annotation
         if ann is bytes:
-            c_func.argtypes += [ctypes.c_char_p, ctypes.c_int]
+            argtypes += [ctypes.c_char_p, ctypes.c_int]
             argfunc_return += f"{name}, len({name}), "
         elif ann is KeySelector:
-            c_func.argtypes += [ctypes.c_char_p] + [ctypes.c_int] * 3
+            argtypes += [ctypes.c_char_p] + [ctypes.c_int] * 3
             argfunc_return += (
                 f"{name}.key, len({name}).key, {name}.or_equal, {name}.offset, "
             )
         else:
             argfunc_return += f"{name}, "
             if hasattr(ann, "__metadata__"):
-                c_func.argtypes += [ann.__metadata__[0]]
+                argtypes += [ann.__metadata__[0]]
             elif ann is param.empty:
-                c_func.argtypes += [ctypes.c_void_p]
+                argtypes += [ctypes.c_void_p]
             else:
-                c_func.argtypes += [ctypes.c_int]
+                argtypes += [ctypes.c_int]
 
-    argfunc_globals: dict[str, Any] = {}
-    exec(
-        f"def argfunc{sig.format(quote_annotation_strings=True)}: return ({argfunc_return})",
-        argfunc_globals,
+    argfunc = make_argfunc(
+        f"def argfunc{sig.format(quote_annotation_strings=True)}: return ({argfunc_return})"
     )
-    argfunc = argfunc_globals["argfunc"]
     inner: Callable
+    restype: object
 
     if inspect.iscoroutinefunction(fn):
         res_func = future_result_handlers[ret]
-        c_func.restype = ctypes.c_void_p
+        restype = ctypes.c_void_p
 
         async def inner(*args, **kwargs) -> Any:
             fdb_fut = Future(c_func(*argfunc(*args, **kwargs)))
@@ -169,10 +174,10 @@ def api_func[T: Callable](fn: T, prefix="") -> T:
                     await fut
                 except:
                     fdb_fut.cancel()
-                    # I have to be able handle the potential race of _cancel()
-                    # against the callback firing, in which I have to know
-                    # whether the callback actually ran and decremented the
-                    # refcount of `fut` by checking _is_ready()
+                    # have to be able handle the potential race of cancel()
+                    # against the callback firing, so use is_ready() to check
+                    # whether the callback has or will run and decrement the
+                    # refcount of `fut`, otherwise decrement it here
                     if not fdb_fut.is_ready():
                         py_decref(fut)
                     raise
@@ -180,13 +185,15 @@ def api_func[T: Callable](fn: T, prefix="") -> T:
 
     else:
         if ret == NoExcept:
-            c_func.restype = None
+            restype = None
         elif ret is float:
-            c_func.restype = ctypes.c_double
+            restype = ctypes.c_double
         elif ret is bool:
-            c_func.restype = bool  # int => bool
+            restype = bool  # int => bool
         else:
-            c_func.errcheck = errcheck  # type: ignore[assignment]
+            restype = ctypes.c_int
+            do_errcheck = True
+            errcheck = errcheck  # type: ignore[assignment]
 
         if isinstance(ret, type) and issubclass(ret, Handle):
 
@@ -199,6 +206,16 @@ def api_func[T: Callable](fn: T, prefix="") -> T:
 
             def inner(*args, **kwargs) -> Any:
                 return c_func(*argfunc(*args, **kwargs))
+
+    def onload():
+        nonlocal c_func
+        c_func = NetworkThread._capi[f"fdb_{prefix}{fn.__name__}"]
+        c_func.argtypes = argtypes
+        c_func.restype = restype
+        if do_errcheck:
+            c_func.errcheck = errcheck
+
+    on_load_init += [onload]
 
     return functools.update_wrapper(inner, fn)  # type: ignore
 
@@ -319,7 +336,6 @@ class Transaction(Handle):
     def set_option(self, option: int, value: bytes) -> None: ...
     def set_read_version(self, version: Annotated[int, ctypes.c_int64]) -> NoExcept: ...
 
-    # direct translations of C API functions
     async def get_read_version(self) -> int: ...
     async def get_estimated_range_size_bytes(self, begin: bytes, end: bytes) -> int: ...
     async def get(self, key: bytes, snapshot: bool) -> bytes | None: ...
