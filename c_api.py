@@ -318,7 +318,7 @@ class Future(Handle):
         )
 
     @register
-    def _(self) -> list[bytes]:
+    def _(self) -> Annotated[list[bytes], 'strings']:
         buf = ctypes.pointer(ctypes.c_char_p())
         count = ctypes.c_int()
         self.get_string_array(ctypes.byref(buf), ctypes.byref(count))
@@ -337,7 +337,7 @@ class Transaction(Handle):
         self, begin: bytes, end: bytes, chunk_size: Annotated[int, ctypes.c_int64]
     ) -> list[bytes]: ...
     async def get_key(self, selector: KeySelector, snapshot: bool) -> bytes: ...
-    async def get_addresses_for_key(self, key: bytes) -> list[bytes]: ...
+    async def get_addresses_for_key(self, key: bytes) -> Annotated[list[bytes], 'strings']: ...
     async def get_range(
         self,
         begin: KeySelector,
